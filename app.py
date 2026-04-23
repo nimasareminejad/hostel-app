@@ -1,6 +1,7 @@
 from flask import Flask, request, redirect, session, render_template_string
 import sqlite3
 from datetime import datetime
+import os
 
 app = Flask(__name__)
 app.secret_key = "secure123"
@@ -35,10 +36,11 @@ def init_db():
 
 init_db()
 
-# ---------------- CONFIG ----------------
+# ---------------- AUTH ----------------
 USER = "nima"
 PASS = "nima1234"
 
+# ---------------- ROOMS ----------------
 rooms = [
     {"name": "اتاق ۱ (۴ تخته)", "beds": 4, "price": 3000},
     {"name": "اتاق ۲ (خصوصی)", "beds": 1, "price": 180000},
@@ -48,8 +50,7 @@ rooms = [
     {"name": "اتاق پسران", "beds": 4, "price": 3500},
 ]
 
-# ---------------- HTML ----------------
-
+# ---------------- LOGIN ----------------
 login_html = """
 <h2>ورود</h2>
 <form method="POST">
@@ -59,15 +60,18 @@ login_html = """
 </form>
 """
 
+# ---------------- DASHBOARD ----------------
 dashboard_html = """
-<h2>داشبورد</h2>
+<h2>داشبورد هاستل</h2>
 <a href="/logout">خروج</a>
+<hr>
 
 {% for room in rooms %}
-<h3>{{room.name}}</h3>
+<h3>{{room.name}} ({{room.price}})</h3>
 
 {% for i in range(room.beds) %}
     {% set found = None %}
+
     {% for b in bookings %}
         {% if b[1]==room.name and b[2]==i %}
             {% set found = b %}
@@ -76,53 +80,55 @@ dashboard_html = """
 
     {% if found %}
         {% set balance = found[6] - found[5] %}
-        <div style="border:2px solid {{'red' if balance>0 else 'green'}};padding:5px;margin:5px">
-            تخت {{i+1}} | {{found[3]}} | بدهی: {{balance}}
-            <a href="/checkout/{{found[0]}}">خروج</a>
-            <a target="_blank" href="https://wa.me/{{found[3]}}">واتساپ</a>
+
+        <div style="border:2px solid {{'red' if balance>0 else 'green'}};padding:10px;margin:5px">
+            تخت {{i+1}} | {{found[3]}} | بدهی: {{balance}} تومان
+            <a href="/checkout/{{found[0]}}">❌ خروج</a>
+            <a target="_blank" href="https://wa.me/{{found[3]}}">📞 واتساپ</a>
         </div>
+
     {% else %}
         <form method="POST" action="/add">
             <input type="hidden" name="room" value="{{room.name}}">
             <input type="hidden" name="bed" value="{{i}}">
+
             <input name="name" placeholder="نام">
             <input name="days" placeholder="روز">
             <input name="paid" placeholder="پرداخت">
+
             <button>ثبت</button>
         </form>
     {% endif %}
+
 {% endfor %}
 <hr>
 {% endfor %}
 
 <h3>ثبت هزینه</h3>
 <form method="POST" action="/expense">
-<input name="title">
-<input name="amount">
+<input name="title" placeholder="عنوان">
+<input name="amount" placeholder="مبلغ">
 <button>ثبت</button>
 </form>
 
 <a href="/report">گزارش</a>
 """
 
+# ---------------- REPORT ----------------
 report_html = """
-<h2>گزارش</h2>
-
-<form>
-از تاریخ: <input name="from">
-تا: <input name="to">
-<button>فیلتر</button>
-</form>
+<h2>گزارش مالی</h2>
 
 <h3>درآمد</h3>
 {% for b in bookings %}
-<div>{{b[3]}} - {{b[5]}}</div>
+<div>{{b[3]}} - {{b[5]}} تومان</div>
 {% endfor %}
 
 <h3>هزینه</h3>
 {% for e in expenses %}
-<div>{{e[1]}} - {{e[2]}}</div>
+<div>{{e[1]}} - {{e[2]}} تومان</div>
 {% endfor %}
+
+<hr>
 
 <h3>جمع</h3>
 درآمد: {{income}} <br>
@@ -130,7 +136,7 @@ report_html = """
 سود: {{income-cost}}
 
 <br><br>
-<button onclick="window.print()">پرینت</button>
+<button onclick="window.print()">پرینت PDF</button>
 """
 
 # ---------------- ROUTES ----------------
@@ -162,12 +168,16 @@ def add():
     days=int(request.form["days"])
     paid=int(request.form["paid"])
 
-    price=3000
-    total=days*price
+    room_data = next(r for r in rooms if r["name"] == room)
+    price = room_data["price"]
+    total = days * price
 
     conn=sqlite3.connect(DB)
-    conn.execute("INSERT INTO bookings (room,bed,name,days,paid,total,date) VALUES (?,?,?,?,?,?,?)",
-                 (room,bed,name,days,paid,total,str(datetime.now())))
+    conn.execute("""INSERT INTO bookings 
+    (room,bed,name,days,paid,total,date)
+    VALUES (?,?,?,?,?,?,?)""",
+    (room,bed,name,days,paid,total,str(datetime.now())))
+
     conn.commit()
     conn.close()
 
@@ -200,13 +210,18 @@ def report():
     income=sum(b[5] for b in bookings)
     cost=sum(e[2] for e in expenses)
 
-    return render_template_string(report_html,bookings=bookings,expenses=expenses,income=income,cost=cost)
+    return render_template_string(report_html,
+                                  bookings=bookings,
+                                  expenses=expenses,
+                                  income=income,
+                                  cost=cost)
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect("/")
 
-if __name__=="__main__":
-    app.run(debug=True)
-
+# ---------------- RUN (Render Compatible) ----------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
