@@ -1,677 +1,329 @@
-# ================= IMPORTS =================
 from flask import Flask, request, redirect, session, render_template_string, jsonify
 import sqlite3
 from datetime import datetime, date, timedelta
+import os
 
 app = Flask(__name__)
-app.secret_key = "fin-tech-pro"
-DB = "hostel_pro.db"
+app.secret_key = "fin-tech-hostel-key-2026"
+DB = "hostel_erp.db"
 
-# ================= DATABASE =================
-
+# ================= DATABASE & INIT =================
 def get_db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def init_db():
-    db = get_db()
-    c = db.cursor()
+    with get_db() as conn:
+        # ساختار اتاق‌ها
+        conn.execute("""CREATE TABLE IF NOT EXISTS rooms (
+            id INTEGER PRIMARY KEY, name TEXT, capacity INTEGER, 
+            base_price INTEGER, room_type TEXT)""")
+        
+        # ساختار رزروها
+        conn.execute("""CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY, room_id INTEGER, bed_number INTEGER, 
+            customer_name TEXT, whatsapp TEXT, checkin_date TEXT, 
+            checkout_date TEXT, daily_rate INTEGER, is_active INTEGER DEFAULT 1,
+            last_charge_date TEXT)""")
 
-    # Rooms
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS rooms(
-        id INTEGER PRIMARY KEY,
-        name TEXT,
-        capacity INTEGER,
-        base_price INTEGER,
-        room_type TEXT
-    )
-    """)
+        # ساختار تراکنش‌های مالی
+        conn.execute("""CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY, booking_id INTEGER, type TEXT, 
+            amount INTEGER, date TEXT, description TEXT,
+            FOREIGN KEY(booking_id) REFERENCES bookings(id))""")
 
-    # Bookings
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS bookings(
-        id INTEGER PRIMARY KEY,
-        room_id INTEGER,
-        bed_number INTEGER,
-        customer_name TEXT,
-        phone TEXT,
-        checkin_date TEXT,
-        checkout_date TEXT,
-        pricing_type TEXT,
-        daily_rate INTEGER,
-        is_active INTEGER DEFAULT 1,
-        last_charge_date TEXT
-    )
-    """)
-
-    # Transactions (Ledger)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS transactions(
-        id INTEGER PRIMARY KEY,
-        booking_id INTEGER,
-        type TEXT,
-        amount INTEGER,
-        date TEXT,
-        description TEXT
-    )
-    """)
-
-    # Expenses
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS expenses(
-        id INTEGER PRIMARY KEY,
-        title TEXT,
-        amount INTEGER,
-        category TEXT,
-        date TEXT
-    )
-    """)
-
-    # Default rooms
-    if c.execute("SELECT COUNT(*) FROM rooms").fetchone()[0] == 0:
-        rooms = [
-            ("VIP", 1, 180000, "خصوصی"),
-            ("عمومی", 4, 35000, "عمومی"),
-            ("اقتصادی", 8, 25000, "اقتصادی"),
-            ("اتاق دختران", 4, 40000, "دختران"),
-            ("اتاق پسران", 4, 40000, "پسران"),
-        ]
-        c.executemany("INSERT INTO rooms(name,capacity,base_price,room_type) VALUES (?,?,?,?)", rooms)
-
-    db.commit()
-    db.close()
+        # داده‌های اولیه اتاق‌ها در صورت خالی بودن دیتابیس
+        if conn.execute("SELECT count(*) FROM rooms").fetchone()[0] == 0:
+            rooms_data = [
+                ("اتاق ۱۰۱ (VIP)", 1, 180000, "خصوصی"),
+                ("اتاق ۱۰۲ (۴ تخته)", 4, 35000, "عمومی"),
+                ("اتاق ۱۰۳ (۸ تخته)", 8, 25000, "اقتصادی")
+            ]
+            conn.executemany("INSERT INTO rooms (name, capacity, base_price, room_type) VALUES (?,?,?,?)", rooms_data)
 
 init_db()
 
-# ================= ACCOUNTING ENGINE =================
-
-def calculate_daily_charge(booking):
-    if booking["pricing_type"] == "monthly":
-        return int(booking["daily_rate"] / 30)
-    return booking["daily_rate"]
-
-
+# ================= CORE LOGIC (ACCOUNTING) =================
 def sync_daily_charges():
+    """محاسبه خودکار بدهی روزانه برای تمام مسافران مقیم تا امروز"""
     db = get_db()
+    active_bookings = db.execute("SELECT * FROM bookings WHERE is_active = 1").fetchall()
     today = date.today()
 
-    bookings = db.execute("SELECT * FROM bookings WHERE is_active=1").fetchall()
+    for b in active_bookings:
+        last_charge = datetime.strptime(b['last_charge_date'], '%Y-%m-%d').date()
+        days_to_charge = (today - last_charge).days
 
-    for b in bookings:
-        last = datetime.strptime(b["last_charge_date"], "%Y-%m-%d").date()
-
-        days = (today - last).days
-
-        for i in range(1, days + 1):
-            charge_day = last + timedelta(days=i)
-
-            # جلوگیری از شارژ بعد از خروج
-            if b["checkout_date"]:
-                checkout = datetime.strptime(b["checkout_date"], "%Y-%m-%d").date()
-                if charge_day > checkout:
-                    continue
-
-            amount = calculate_daily_charge(b)
-
-            db.execute("""
-            INSERT INTO transactions(booking_id,type,amount,date,description)
-            VALUES (?,?,?,?,?)
-            """, (
-                b["id"],
-                "charge",
-                amount,
-                str(charge_day),
-                f"شارژ روز {charge_day}"
-            ))
-
-        db.execute("UPDATE bookings SET last_charge_date=? WHERE id=?",
-                   (str(today), b["id"]))
-
+        if days_to_charge > 0:
+            for i in range(1, days_to_charge + 1):
+                charge_date = last_charge + timedelta(days=i)
+                db.execute("""INSERT INTO transactions (booking_id, type, amount, date, description) 
+                           VALUES (?, 'charge', ?, ?, ?)""", 
+                           (b['id'], b['daily_rate'], str(charge_date), f"شارژ اقامت روز {charge_date}"))
+            
+            db.execute("UPDATE bookings SET last_charge_date = ? WHERE id = ?", (str(today), b['id']))
     db.commit()
-    db.close()
 
-
-def get_balance(bid):
+def get_booking_balance(booking_id):
     db = get_db()
+    charges = db.execute("SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type='charge'", (booking_id,)).fetchone()[0] or 0
+    payments = db.execute("SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type='payment'", (booking_id,)).fetchone()[0] or 0
+    return charges - payments
 
-    charge = db.execute(
-        "SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type='charge'",
-        (bid,)
-    ).fetchone()[0] or 0
+# ================= ROUTES =================
+@app.route("/")
+def index():
+    if not session.get("login"):
+        return '''<body style="direction:rtl; font-family:tahoma; background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh;">
+            <form action="/login" method="POST" style="background:white; padding:40px; border-radius:20px; box-shadow:0 10px 25px rgba(0,0,0,0.1);">
+                <h2 style="margin-bottom:20px;">مدیریت هوشمند هاستل</h2>
+                <input name="u" placeholder="نام کاربری" style="display:block; width:100%; padding:10px; margin-bottom:10px; border:1px solid #ddd; border-radius:8px;">
+                <input name="p" type="password" placeholder="رمز عبور" style="display:block; width:100%; padding:10px; margin-bottom:20px; border:1px solid #ddd; border-radius:8px;">
+                <button style="width:100%; padding:12px; background:#4361ee; color:white; border:none; border-radius:8px; cursor:pointer;">ورود به سیستم</button>
+            </form></body>'''
+    return redirect("/dashboard")
 
-    pay = db.execute(
-        "SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type='payment'",
-        (bid,)
-    ).fetchone()[0] or 0
-
-    db.close()
-    return charge - pay
-
-
-# ================= HELPERS =================
-
-def get_days_left(booking):
-    if not booking["checkout_date"]:
-        return None
-
-    checkout = datetime.strptime(booking["checkout_date"], "%Y-%m-%d").date()
-    return (checkout - date.today()).days
-
-
-def get_payment_total(bid):
-    db = get_db()
-    val = db.execute(
-        "SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type='payment'",
-        (bid,)
-    ).fetchone()[0] or 0
-    db.close()
-    return val
-
-
-# ================= AUTH =================
-
-@app.route("/", methods=["GET", "POST"])
+@app.route("/login", methods=["POST"])
 def login():
-    if request.method == "POST":
-        if request.form["u"] == "admin" and request.form["p"] == "admin123":
-            session["login"] = True
-            return redirect("/dashboard")
+    if request.form["u"] == "admin" and request.form["p"] == "admin123":
+        session["login"] = True
+    return redirect("/dashboard")
 
-    return """
-    <form method="POST" style="text-align:center;margin-top:100px">
-        <input name="u" placeholder="user"><br><br>
-        <input name="p" type="password" placeholder="pass"><br><br>
-        <button>Login</button>
-    </form>
-    # ================= DASHBOARD =================
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
 
 @app.route("/dashboard")
 def dashboard():
-    if not session.get("login"):
-        return redirect("/")
-
+    if not session.get("login"): return redirect("/")
     sync_daily_charges()
-
+    
     db = get_db()
-
     rooms = [dict(r) for r in db.execute("SELECT * FROM rooms").fetchall()]
-    bookings = [dict(b) for b in db.execute("SELECT * FROM bookings WHERE is_active=1").fetchall()]
-
-    total_beds = sum(r["capacity"] for r in rooms)
-    occupied = len(bookings)
-
-    # attach booking to beds
+    all_bookings = [dict(b) for b in db.execute("SELECT * FROM bookings WHERE is_active=1").fetchall()]
+    
+    total_debt = 0
     for r in rooms:
-        r["beds"] = []
-        for i in range(1, r["capacity"] + 1):
-            b = next((x for x in bookings if x["room_id"] == r["id"] and x["bed_number"] == i), None)
-
-            if b:
-                b["balance"] = get_balance(b["id"])
-                b["paid"] = get_payment_total(b["id"])
-                b["days_left"] = get_days_left(b)
-                r["beds"].append({"status": "full", "data": b})
+        r['beds'] = []
+        for i in range(1, r['capacity'] + 1):
+            booking = next((b for b in all_bookings if b['room_id'] == r['id'] and b['bed_number'] == i), None)
+            if booking:
+                balance = get_booking_balance(booking['id'])
+                booking['balance'] = balance
+                if balance > 0: total_debt += balance
+                r['beds'].append({'status': 'occupied', 'data': booking})
             else:
-                r["beds"].append({"status": "empty", "bed": i})
-
-    db.close()
-
-    return render_template_string(DASHBOARD_HTML,
-                                  rooms=rooms,
-                                  total=total_beds,
-                                  occupied=occupied,
-                                  empty=total_beds - occupied)
-
-
-# ================= API =================
+                r['beds'].append({'status': 'empty', 'bed_num': i})
+    
+    stats = {
+        "daily_revenue": db.execute("SELECT SUM(amount) FROM transactions WHERE type='payment' AND date=?", (str(date.today()),)).fetchone()[0] or 0,
+        "total_debt": total_debt,
+        "active_guests": len(all_bookings)
+    }
+    return render_template_string(dashboard_html, rooms=rooms, stats=stats)
 
 @app.route("/api/booking/<int:bid>")
-def booking_api(bid):
+def get_booking_details(bid):
     db = get_db()
-
-    b = dict(db.execute("SELECT * FROM bookings WHERE id=?", (bid,)).fetchone())
-
-    tx = [dict(t) for t in db.execute("""
-        SELECT * FROM transactions
-        WHERE booking_id=?
-        ORDER BY date DESC
-    """, (bid,)).fetchall()]
-
-    db.close()
-
-    return jsonify({
-        "booking": b,
-        "transactions": tx,
-        "balance": get_balance(bid),
-        "paid": get_payment_total(bid)
-    })
-
-
-# ================= ACTIONS =================
+    booking = dict(db.execute("SELECT * FROM bookings WHERE id=?", (bid,)).fetchone())
+    ledger = [dict(t) for t in db.execute("SELECT * FROM transactions WHERE booking_id=? ORDER BY date DESC", (bid,)).fetchall()]
+    balance = get_booking_balance(bid)
+    return jsonify({'booking': booking, 'ledger': ledger, 'balance': balance})
 
 @app.route("/action/checkin", methods=["POST"])
-def checkin():
+def action_checkin():
     db = get_db()
-    today = str(date.today())
-
-    cur = db.execute("""
-    INSERT INTO bookings(
-        room_id,bed_number,customer_name,phone,
-        checkin_date,checkout_date,pricing_type,
-        daily_rate,last_charge_date
-    ) VALUES (?,?,?,?,?,?,?,?,?)
-    """, (
-        request.form["room_id"],
-        request.form["bed"],
-        request.form["name"],
-        request.form["phone"],
-        today,
-        request.form.get("checkout"),
-        request.form["type"],
-        request.form["rate"],
-        today
-    ))
-
-    bid = cur.lastrowid
-
-    # prepayment
-    pay = int(request.form.get("payment", 0))
-    if pay > 0:
-        db.execute("""
-        INSERT INTO transactions(booking_id,type,amount,date,description)
-        VALUES (?,?,?,?,?)
-        """, (bid, "payment", pay, today, "پیش پرداخت"))
-
+    c_date = str(date.today())
+    cursor = db.execute("""INSERT INTO bookings 
+        (room_id, bed_number, customer_name, whatsapp, checkin_date, last_charge_date, daily_rate) 
+        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (request.form['room_id'], request.form['bed_num'], request.form['name'], 
+         request.form['whatsapp'], c_date, c_date, request.form['rate']))
+    
+    booking_id = cursor.lastrowid
+    payment = int(request.form.get('payment', 0))
+    if payment > 0:
+        db.execute("INSERT INTO transactions (booking_id, type, amount, date, description) VALUES (?, 'payment', ?, ?, ?)", 
+                   (booking_id, payment, c_date, "پیش‌پرداخت هنگام پذیرش"))
     db.commit()
-    db.close()
     return redirect("/dashboard")
 
-
-@app.route("/action/payment", methods=["POST"])
-def payment():
+@app.route("/action/add-payment", methods=["POST"])
+def add_payment():
     db = get_db()
-
-    db.execute("""
-    INSERT INTO transactions(booking_id,type,amount,date,description)
-    VALUES (?,?,?,?,?)
-    """, (
-        request.form["bid"],
-        "payment",
-        request.form["amount"],
-        str(date.today()),
-        request.form.get("desc", "پرداخت")
-    ))
-
+    db.execute("INSERT INTO transactions (booking_id, type, amount, date, description) VALUES (?, 'payment', ?, ?, ?)", 
+               (request.form['booking_id'], int(request.form['amount']), str(date.today()), "دریافت نقدی / کارت"))
     db.commit()
-    db.close()
     return redirect("/dashboard")
-
 
 @app.route("/action/checkout/<int:bid>")
-def checkout(bid):
+def action_checkout(bid):
     db = get_db()
-
-    db.execute("""
-    UPDATE bookings
-    SET is_active=0, checkout_date=?
-    WHERE id=?
-    """, (str(date.today()), bid))
-
+    db.execute("UPDATE bookings SET is_active=0, checkout_date=? WHERE id=?", (str(date.today()), bid))
     db.commit()
-    db.close()
     return redirect("/dashboard")
 
-
-@app.route("/action/extend", methods=["POST"])
-def extend():
-    db = get_db()
-
-    bid = request.form["bid"]
-    days = int(request.form["days"])
-
-    b = db.execute("SELECT * FROM bookings WHERE id=?", (bid,)).fetchone()
-
-    if b["checkout_date"]:
-        base = datetime.strptime(b["checkout_date"], "%Y-%m-%d").date()
-    else:
-        base = date.today()
-
-    new_date = base + timedelta(days=days)
-
-    db.execute("UPDATE bookings SET checkout_date=? WHERE id=?",
-               (str(new_date), bid))
-
-    db.commit()
-    db.close()
-    return redirect("/dashboard")
-
-
-# ================= UI =================
-
-DASHBOARD_HTML = """
+# ================= UI DESIGN (HTML) =================
+dashboard_html = """
 <!DOCTYPE html>
-<html dir="rtl">
+<html lang="fa" dir="rtl">
 <head>
-<meta charset="UTF-8">
-<title>ERP</title>
-<style>
-body{font-family:tahoma;background:#f5f5f5;padding:20px}
-.card{background:white;padding:15px;margin:10px;border-radius:10px}
-.bed{display:inline-block;width:140px;height:140px;margin:5px;padding:10px;border-radius:10px;cursor:pointer}
-.empty{background:#eee}
-.full{background:#d1e7ff}
-.debt{color:red}
-.ok{color:green}
-</style>
+    <meta charset="UTF-8">
+    <title>پنل هوشمند هاستل</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;500;800&display=swap');
+        :root { --primary: #635bff; --bg: #f8fafc; }
+        body { background: var(--bg); font-family: 'Vazirmatn', sans-serif; padding-top: 20px; }
+        .sidebar { width: 260px; height: 100vh; position: fixed; right: 0; top: 0; background: white; border-left: 1px solid #e2e8f0; padding: 25px; }
+        .main-content { margin-right: 260px; padding: 0 30px 50px 30px; }
+        .stat-card { background: white; border-radius: 15px; padding: 20px; border: 1px solid #e2e8f0; }
+        .room-section { background: white; border-radius: 15px; padding: 20px; margin-bottom: 25px; border: 1px solid #e2e8f0; }
+        .bed-unit { 
+            width: 130px; height: 140px; border-radius: 12px; border: 2px dashed #cbd5e1; 
+            display: flex; flex-direction: column; align-items: center; justify-content: center; 
+            cursor: pointer; transition: 0.2s; background: #fff; position: relative;
+        }
+        .bed-unit.occupied { border: 2px solid var(--primary); background: #f8faff; }
+        .balance-badge { position: absolute; bottom: 8px; font-size: 10px; padding: 2px 8px; border-radius: 20px; }
+        .debt { background: #fee2e2; color: #ef4444; }
+        .credit { background: #dcfce7; color: #22c55e; }
+        .settled { background: #f1f5f9; color: #64748b; }
+        .ledger-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
+    </style>
 </head>
 <body>
+    <aside class="sidebar">
+        <h4 class="fw-bold text-primary mb-4">هاستل سیستم</h4>
+        <nav class="nav flex-column gap-2">
+            <a href="/dashboard" class="nav-link active"><i class="fas fa-home me-2"></i> داشبورد مدیریتی</a>
+            <a href="#" class="nav-link text-muted"><i class="fas fa-users me-2"></i> لیست تمام مهمانان</a>
+            <a href="/logout" class="nav-link text-danger mt-5"><i class="fas fa-power-off me-2"></i> خروج</a>
+        </nav>
+    </aside>
 
-<h2>داشبورد</h2>
-
-<div class="card">
-کل تخت: {{total}} |
-پر: {{occupied}} |
-خالی: {{empty}}
-<a href="/report">📄 گزارش</a>
-</div>
-
-{% for r in rooms %}
-<div class="card">
-<h3>{{r.name}}</h3>
-
-{% for b in r.beds %}
-    {% if b.status=="empty" %}
-        <div class="bed empty" onclick="checkin({{r.id}},{{b.bed}})">
-        تخت {{b.bed}}<br>خالی
+    <main class="main-content">
+        <div class="row g-4 mb-4">
+            <div class="col-md-4">
+                <div class="stat-card">
+                    <small class="text-muted">وصولی نقدی امروز</small>
+                    <h3 class="fw-bold text-success">{{ "{:,.0f}".format(stats.daily_revenue) }}</h3>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="stat-card">
+                    <small class="text-muted">کل مطالبات لحظه‌ای</small>
+                    <h3 class="fw-bold text-danger">{{ "{:,.0f}".format(stats.total_debt) }}</h3>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="stat-card">
+                    <small class="text-muted">تخت‌های اشغال شده</small>
+                    <h3 class="fw-bold">{{ stats.active_guests }} تخت</h3>
+                </div>
+            </div>
         </div>
-    {% else %}
-        <div class="bed full" onclick="ledger({{b.data.id}})">
-        {{b.data.customer_name}}<br>
-        {% if b.data.balance>0 %}
-            <span class="debt">{{b.data.balance}}</span>
-        {% else %}
-            <span class="ok">تسویه</span>
-        {% endif %}
-        <br>
-        {{b.data.days_left if b.data.days_left!=None else ''}}
+
+        <h5 class="fw-bold mb-3">نقشه اتاق‌ها و وضعیت تخت‌ها</h5>
+        {% for room in rooms %}
+        <div class="room-section">
+            <h6 class="fw-bold mb-3">{{ room.name }} <span class="badge bg-light text-muted">{{ room.room_type }}</span></h6>
+            <div class="d-flex flex-wrap gap-3">
+                {% for bed in room.beds %}
+                    {% if bed.status == 'empty' %}
+                    <div class="bed-unit" onclick="openCheckin({{ room.id }}, {{ bed.bed_num }}, {{ room.base_price }})">
+                        <i class="fas fa-plus text-muted mb-2"></i>
+                        <span class="small">تخت {{ bed.bed_num }}</span>
+                    </div>
+                    {% else %}
+                    <div class="bed-unit occupied" onclick="openLedger({{ bed.data.id }})">
+                        <i class="fas fa-user text-primary mb-2"></i>
+                        <span class="small fw-bold">{{ bed.data.customer_name[:15] }}</span>
+                        <span class="balance-badge {% if bed.data.balance > 0 %}debt{% elif bed.data.balance < 0 %}credit{% else %}settled{% endif %}">
+                            {{ "{:,.0f}".format(bed.data.balance|abs) if bed.data.balance != 0 else 'تسویه' }}
+                        </span>
+                    </div>
+                    {% endif %}
+                {% endfor %}
+            </div>
         </div>
-    {% endif %}
-{% endfor %}
+        {% endfor %}
+    </main>
 
-</div>
-{% endfor %}
-
-<!-- CHECKIN -->
-<div id="checkinBox" style="display:none">
-<form method="POST" action="/action/checkin">
-<input name="room_id" id="r">
-<input name="bed" id="b">
-<input name="name" placeholder="نام"><br>
-<input name="phone" placeholder="شماره"><br>
-<input name="rate" placeholder="نرخ"><br>
-<select name="type">
-<option value="daily">روزانه</option>
-<option value="monthly">ماهانه</option>
-</select><br>
-<input name="checkout" placeholder="تاریخ خروج"><br>
-<input name="payment" placeholder="پیش پرداخت"><br>
-<button>ثبت</button>
-</form>
-</div>
-
-<!-- LEDGER -->
-<div id="ledgerBox"></div>
-
-<script>
-function checkin(r,b){
-    document.getElementById("checkinBox").style.display="block"
-    document.getElementById("r").value=r
-    document.getElementById("b").value=b
-}
-
-async function ledger(id){
-    let res = await fetch("/api/booking/"+id)
-    let data = await res.json()
-
-    let html = `
-    <div class="card">
-    <h3>${data.booking.customer_name}</h3>
-    مانده: ${data.balance}<br>
-    پرداختی: ${data.paid}<br>
-
-    <form method="POST" action="/action/payment">
-        <input name="bid" value="${id}">
-        <input name="amount" placeholder="مبلغ">
-        <button>ثبت پرداخت</button>
-    </form>
-
-    <form method="POST" action="/action/extend">
-        <input name="bid" value="${id}">
-        <input name="days" placeholder="روز تمدید">
-        <button>تمدید</button>
-    </form>
-
-    <a href="/action/checkout/${id}">خروج</a>
-
-    <hr>
-    ${data.transactions.map(t=>`
-        <div>${t.date} | ${t.type} | ${t.amount}</div>
-    `).join("")}
+    <div class="modal fade" id="checkinModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <form action="/action/checkin" method="POST" class="modal-content border-0 p-4 rounded-4">
+                <input type="hidden" name="room_id" id="m_room_id">
+                <input type="hidden" name="bed_num" id="m_bed_num">
+                <h5 class="fw-bold mb-3">پذیرش سریع مسافر</h5>
+                <input type="text" name="name" class="form-control mb-2" placeholder="نام مسافر" required>
+                <input type="text" name="whatsapp" class="form-control mb-2" placeholder="واتس‌اپ">
+                <div class="row g-2">
+                    <div class="col-6"><input type="number" name="rate" id="m_rate" class="form-control" placeholder="نرخ شبی"></div>
+                    <div class="col-6"><input type="number" name="payment" class="form-control" placeholder="دریافتی اول"></div>
+                </div>
+                <button class="btn btn-primary w-100 mt-3 py-2 fw-bold">ثبت و ورود</button>
+            </form>
+        </div>
     </div>
-    `
 
-    document.getElementById("ledgerBox").innerHTML = html
-}
-</script>
+    <div class="modal fade" id="ledgerModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content border-0 p-4 rounded-4" id="ledgerContent">
+                </div>
+        </div>
+    </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function openCheckin(rid, bnum, rate) {
+            document.getElementById('m_room_id').value = rid;
+            document.getElementById('m_bed_num').value = bnum;
+            document.getElementById('m_rate').value = rate;
+            new bootstrap.Modal(document.getElementById('checkinModal')).show();
+        }
+
+        async function openLedger(bid) {
+            const res = await fetch('/api/booking/' + bid);
+            const data = await res.json();
+            const b = data.booking;
+            
+            let html = `
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <div>
+                        <h4 class="fw-bold mb-0">${b.customer_name}</h4>
+                        <small class="text-muted">ورود: ${b.checkin_date} | نرخ: ${b.daily_rate} تومان</small>
+                    </div>
+                    <span class="badge ${data.balance > 0 ? 'bg-danger' : 'bg-success'} fs-5">مانده: ${Math.abs(data.balance)}</span>
+                </div>
+                <div style="max-height: 250px; overflow-y: auto" class="mb-3">
+                    ${data.ledger.map(t => `
+                        <div class="ledger-row">
+                            <span>${t.description} <small class="text-muted">${t.date}</small></span>
+                            <span class="${t.type=='charge'?'text-warning':'text-success'} fw-bold">${t.type=='charge'?'+':'-'}${t.amount}</span>
+                        </div>
+                    `).join('')}
+                </div>
+                <form action="/action/add-payment" method="POST" class="input-group mb-3">
+                    <input type="hidden" name="booking_id" value="${b.id}">
+                    <input type="number" name="amount" class="form-control" placeholder="مبلغ دریافتی جدید..." required>
+                    <button class="btn btn-success">ثبت دریافت</button>
+                </form>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-outline-secondary flex-grow-1">چاپ فاکتور</button>
+                    <a href="/action/checkout/${b.id}" class="btn btn-danger" onclick="return confirm('تسویه نهایی انجام شود؟')">خروج مسافر</a>
+                </div>
+            `;
+            document.getElementById('ledgerContent').innerHTML = html;
+            new bootstrap.Modal(document.getElementById('ledgerModal')).show();
+        }
+    </script>
 </body>
 </html>
-# ================= REPORT (MANAGEMENT) =================
+"""
 
-@app.route("/report")
-def report():
-    if not session.get("login"):
-        return redirect("/")
-
-    db = get_db()
-
-    # data
-    rows = db.execute("""
-    SELECT 
-        b.id,
-        b.customer_name,
-        b.checkin_date,
-        b.checkout_date,
-        b.daily_rate,
-        b.pricing_type,
-        r.name as room_name,
-        r.capacity,
-        b.bed_number
-    FROM bookings b
-    JOIN rooms r ON r.id = b.room_id
-    ORDER BY b.checkin_date DESC
-    """).fetchall()
-
-    # stats
-    total_beds = db.execute("SELECT SUM(capacity) FROM rooms").fetchone()[0]
-    active = db.execute("SELECT COUNT(*) FROM bookings WHERE is_active=1").fetchone()[0]
-
-    # enrich data
-    final = []
-    total_paid_all = 0
-    total_debt_all = 0
-
-    for r in rows:
-        paid = get_payment_total(r["id"])
-        bal = get_balance(r["id"])
-
-        total_paid_all += paid
-        if bal > 0:
-            total_debt_all += bal
-
-        final.append({
-            "name": r["customer_name"],
-            "room": r["room_name"],
-            "bed": r["bed_number"],
-            "checkin": r["checkin_date"],
-            "checkout": r["checkout_date"] or "-",
-            "rate": r["daily_rate"],
-            "type": r["pricing_type"],
-            "paid": paid,
-            "balance": bal
-        })
-
-    db.close()
-
-    return render_template_string(REPORT_HTML,
-                                  data=final,
-                                  total=total_beds,
-                                  active=active,
-                                  empty=total_beds - active,
-                                  total_paid=total_paid_all,
-                                  total_debt=total_debt_all,
-                                  now=datetime.now().strftime("%Y-%m-%d %H:%M"))
-
-
-# ================= REPORT UI =================
-
-REPORT_HTML = """
-<!DOCTYPE html>
-<html dir="rtl">
-<head>
-<meta charset="UTF-8">
-<title>گزارش مدیریتی</title>
-
-<style>
-body{
-    font-family:tahoma;
-    background:white;
-    padding:40px;
-}
-
-h1,h2,h3{
-    margin:5px 0;
-}
-
-.header{
-    text-align:center;
-    margin-bottom:30px;
-}
-
-.stats{
-    display:flex;
-    justify-content:space-between;
-    margin-bottom:20px;
-}
-
-.stat{
-    border:1px solid #ccc;
-    padding:10px;
-    border-radius:8px;
-    width:23%;
-    text-align:center;
-}
-
-table{
-    width:100%;
-    border-collapse:collapse;
-    margin-top:20px;
-}
-
-th,td{
-    border:1px solid #ccc;
-    padding:8px;
-    text-align:center;
-    font-size:13px;
-}
-
-th{
-    background:#f0f0f0;
-}
-
-.debt{color:red;font-weight:bold}
-.ok{color:green}
-
-.footer{
-    margin-top:30px;
-    text-align:left;
-    font-size:12px;
-}
-
-/* PRINT STYLE */
-@media print{
-    body{padding:10px}
-    .no-print{display:none}
-}
-</style>
-</head>
-
-<body>
-
-<div class="header">
-    <h1>گزارش مدیریتی هاستل</h1>
-    <small>تاریخ: {{now}}</small>
-</div>
-
-<div class="stats">
-    <div class="stat">کل تخت<br><b>{{total}}</b></div>
-    <div class="stat">پر<br><b>{{active}}</b></div>
-    <div class="stat">خالی<br><b>{{empty}}</b></div>
-    <div class="stat">کل دریافتی<br><b>{{"{:,}".format(total_paid)}}</b></div>
-</div>
-
-<div class="stats">
-    <div class="stat" style="width:100%">
-        کل بدهکاران<br>
-        <b style="color:red">{{"{:,}".format(total_debt)}}</b>
-    </div>
-</div>
-
-<table>
-<tr>
-<th>نام</th>
-<th>اتاق</th>
-<th>تخت</th>
-<th>ورود</th>
-<th>خروج</th>
-<th>نرخ</th>
-<th>نوع</th>
-<th>پرداختی</th>
-<th>مانده</th>
-</tr>
-
-{% for r in data %}
-<tr>
-<td>{{r.name}}</td>
-<td>{{r.room}}</td>
-<td>{{r.bed}}</td>
-<td>{{r.checkin}}</td>
-<td>{{r.checkout}}</td>
-<td>{{r.rate}}</td>
-<td>{{r.type}}</td>
-<td>{{"{:,}".format(r.paid)}}</td>
-<td>
-    {% if r.balance>0 %}
-        <span class="debt">{{"{:,}".format(r.balance)}}</span>
-    {% else %}
-        <span class="ok">تسویه</span>
-    {% endif %}
-</td>
-</tr>
-{% endfor %}
-
-</table>
-
-<div class="footer">
-    امضا مدیر: ______________________
-</div>
-
-<script>
-window.print()
-</script>
-
-</body>
-</html>
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
