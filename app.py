@@ -8,6 +8,7 @@ logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "hostel-super-secure-key-2026")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# برای ریست کردن کل سیستم، نام فایل زیر را عوض کن (مثلا hostel_v2.db)
 DB_PATH = os.path.join(BASE_DIR, "hostel_main.db")
 
 def get_db_connection():
@@ -31,6 +32,11 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id INTEGER, 
             type TEXT, amount INTEGER, date TEXT, description TEXT)""")
+
+        # جدول جدید برای هزینه های هاستل
+        conn.execute("""CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            title TEXT, amount INTEGER, date TEXT, category TEXT)""")
 
         if conn.execute("SELECT count(*) FROM rooms").fetchone()[0] == 0:
             rooms_data = [
@@ -86,16 +92,17 @@ DASHBOARD_HTML = """
         .room-card { background: white; border-radius: 15px; padding: 15px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
         .bed { width: 85px; height: 85px; border-radius: 12px; border: 2px dashed #cbd5e1; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; font-size: 11px; background: white; transition: 0.2s; }
         .bed.occupied { border: 2px solid #4361ee; background: #eff6ff; }
-        .bed:hover { transform: translateY(-3px); }
-        .stat-box { background: white; padding: 15px; border-radius: 12px; text-align: center; border-bottom: 4px solid #4361ee; }
+        .stat-box { background: white; padding: 15px; border-radius: 12px; text-align: center; border-bottom: 4px solid #4361ee; min-height: 100px; }
+        .bg-profit { border-bottom: 4px solid #10b981 !important; }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-dark bg-dark mb-4 shadow">
         <div class="container">
-            <span class="navbar-brand fw-bold"><i class="fa fa-hotel me-2"></i> سیستم مدیریت طبقات هاستل</span>
+            <span class="navbar-brand fw-bold"><i class="fa fa-hotel me-2"></i> مدیریت هاستل (نسخه مالی)</span>
             <div class="d-flex gap-2">
-                <a href="/report/all" class="btn btn-primary btn-sm"><i class="fa fa-print"></i> گزارش کل مسافران</a>
+                <button class="btn btn-warning btn-sm" onclick="new bootstrap.Modal(document.getElementById('expenseModal')).show()"><i class="fa fa-minus-circle"></i> ثبت هزینه</button>
+                <a href="/report/all" class="btn btn-primary btn-sm"><i class="fa fa-print"></i> گزارش مسافران</a>
                 <a href="/logout" class="btn btn-outline-light btn-sm">خروج</a>
             </div>
         </div>
@@ -103,9 +110,10 @@ DASHBOARD_HTML = """
 
     <div class="container pb-5">
         <div class="row g-3 mb-4">
-            <div class="col-md-4"><div class="stat-box">وصولی امروز: <br><b class="text-success">{{ "{:,.0f}".format(stats.revenue) }}</b></div></div>
-            <div class="col-md-4"><div class="stat-box">مطالبات کل: <br><b class="text-danger">{{ "{:,.0f}".format(stats.debt) }}</b></div></div>
-            <div class="col-md-4"><div class="stat-box">تخت‌های پر: <br><b>{{ stats.count }} تخت</b></div></div>
+            <div class="col-md-3"><div class="stat-box">درآمد کل (دریافتی): <br><b class="text-success">{{ "{:,.0f}".format(stats.total_income) }}</b></div></div>
+            <div class="col-md-3"><div class="stat-box">هزینه‌های کل: <br><b class="text-danger">{{ "{:,.0f}".format(stats.total_expenses) }}</b></div></div>
+            <div class="col-md-3"><div class="stat-box bg-profit">سود خالص: <br><b class="text-primary" style="font-size: 1.2rem;">{{ "{:,.0f}".format(stats.net_profit) }}</b></div></div>
+            <div class="col-md-3"><div class="stat-box">مطالبات (در بازار): <br><b class="text-warning">{{ "{:,.0f}".format(stats.debt) }}</b></div></div>
         </div>
 
         {% for floor in [1, 2] %}
@@ -114,7 +122,7 @@ DASHBOARD_HTML = """
             {% for room in rooms if room.floor == floor %}
             <div class="col-12">
                 <div class="room-card">
-                    <h6 class="fw-bold mb-3 text-secondary border-bottom pb-2">{{ room.name }} <small class="fw-normal">({{ room.room_type }})</small></h6>
+                    <h6 class="fw-bold mb-3 text-secondary border-bottom pb-2">{{ room.name }}</h6>
                     <div class="d-flex flex-wrap gap-2">
                         {% for bed in room.beds %}
                             {% if bed.status == 'empty' %}
@@ -138,20 +146,36 @@ DASHBOARD_HTML = """
         {% endfor %}
     </div>
 
+    <div class="modal fade" id="expenseModal" tabindex="-1"><div class="modal-dialog"><form action="/action/expense" method="POST" class="modal-content p-4">
+        <h5 class="fw-bold mb-3">ثبت هزینه جدید (خروجی)</h5>
+        <div class="mb-2"><label class="small">عنوان هزینه (مثلا قبض برق، خرید شوینده)</label><input type="text" name="title" class="form-control" required></div>
+        <div class="mb-2"><label class="small">مبلغ (تومان)</label><input type="number" name="amount" class="form-control" required></div>
+        <div class="mb-3"><label class="small">دسته بندی</label>
+            <select name="category" class="form-select">
+                <option value="قبوض">قبوض</option>
+                <option value="خرید">خرید لوازم</option>
+                <option value="تعمیرات">تعمیرات</option>
+                <option value="پرسنل">پرسنل/نظافت</option>
+                <option value="سایر">سایر</option>
+            </select>
+        </div>
+        <button class="btn btn-danger w-100">ثبت در هزینه‌ها</button>
+    </form></div></div>
+
     <div class="modal fade" id="checkinModal" tabindex="-1"><div class="modal-dialog"><form action="/action/checkin" method="POST" class="modal-content p-4">
         <input type="hidden" name="rid" id="in_rid"><input type="hidden" name="bnum" id="in_bnum">
-        <h5 class="fw-bold mb-3">پذیرش تخت جدید</h5>
-        <div class="mb-2"><label class="small">نام و نام خانوادگی</label><input type="text" name="name" class="form-control" required></div>
-        <div class="mb-2"><label class="small">شماره پاسپورت / کارت ملی</label><input type="text" name="passport" class="form-control" required></div>
+        <h5 class="fw-bold mb-3 text-primary">پذیرش تخت جدید</h5>
+        <input type="text" name="name" class="form-control mb-2" placeholder="نام مسافر" required>
+        <input type="text" name="passport" class="form-control mb-2" placeholder="کد ملی / پاسپورت" required>
         <div class="row g-2 mb-2">
             <div class="col-6"><label class="small">تاریخ ورود</label><input type="date" name="checkin" class="form-control" value="{{ stats.today }}"></div>
             <div class="col-6"><label class="small">خروج احتمالی</label><input type="date" name="checkout" class="form-control"></div>
         </div>
         <div class="row g-2 mb-3">
-            <div class="col-6"><label class="small">نرخ هر شب (تومان)</label><input type="number" name="rate" id="in_rate" class="form-control"></div>
-            <div class="col-6"><label class="small">پیش‌پرداخت</label><input type="number" name="payment" class="form-control"></div>
+            <div class="col-6"><label class="small">نرخ شبانه</label><input type="number" name="rate" id="in_rate" class="form-control"></div>
+            <div class="col-6"><label class="small">پیش‌پرداخت</label><input type="number" name="payment" class="form-control" value="0"></div>
         </div>
-        <button class="btn btn-primary w-100 py-2 fw-bold">ثبت و ایجاد پرونده</button>
+        <button class="btn btn-primary w-100 py-2 fw-bold">ثبت مسافر</button>
     </form></div></div>
 
     <div class="modal fade" id="ledgerModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content p-4" id="ledgerBody"></div></div></div>
@@ -169,14 +193,21 @@ DASHBOARD_HTML = """
             const d = await res.json();
             let html = `
                 <div class="d-flex justify-content-between align-items-center mb-3">
-                    <div><h4 class="fw-bold m-0">${d.guest.customer_name}</h4><small>پاسپورت: ${d.guest.passport}</small></div>
-                    <div class="text-end">مانده بدهی:<br><h4 class="text-danger fw-bold">${d.balance.toLocaleString()}</h4></div>
+                    <div><h4 class="fw-bold m-0">${d.guest.customer_name}</h4><small>ID: ${d.guest.passport}</small></div>
+                    <div class="text-end">مانده:<br><h4 class="text-danger fw-bold">${d.balance.toLocaleString()}</h4></div>
                 </div>
-                <div style="max-height:250px; overflow-y:auto" class="border rounded p-3 bg-light mb-3">
-                    ${d.ledger.map(t => `<div class="d-flex justify-content-between py-2 border-bottom small"><span>${t.description} <br><small class="text-muted">${t.date}</small></span><b class="${t.type=='charge'?'text-danger':'text-success'}">${t.type=='charge'?'+':'-'}${t.amount.toLocaleString()}</b></div>`).join('')}
+                <div style="max-height:200px; overflow-y:auto" class="border rounded p-2 bg-light mb-3 small">
+                    ${d.ledger.map(t => `<div class="d-flex justify-content-between py-1 border-bottom"><span>${t.description}</span><b class="${t.type=='charge'?'text-danger':'text-success'}">${t.amount.toLocaleString()}</b></div>`).join('')}
                 </div>
-                <form action="/action/pay" method="POST" class="input-group mb-3"><input type="hidden" name="bid" value="${d.guest.id}"><input type="number" name="amount" class="form-control" placeholder="دریافت مبلغ جدید..." required><button class="btn btn-success">ثبت دریافت</button></form>
-                <div class="d-flex gap-2"><button onclick="window.print()" class="btn btn-outline-secondary flex-grow-1">چاپ رسید</button><a href="/action/checkout/${d.guest.id}" class="btn btn-danger" onclick="return confirm('آیا مسافر تسویه کامل کرده و خارج شده است؟')">خروج نهایی</a></div>
+                <form action="/action/pay" method="POST" class="input-group mb-3">
+                    <input type="hidden" name="bid" value="${d.guest.id}">
+                    <input type="number" name="amount" class="form-control" placeholder="مبلغ دریافتی..." required>
+                    <button class="btn btn-success text-white">ثبت دریافت</button>
+                </form>
+                <div class="d-flex gap-2">
+                    <button onclick="window.print()" class="btn btn-outline-secondary flex-grow-1">چاپ</button>
+                    <a href="/action/checkout/${d.guest.id}" class="btn btn-danger" onclick="return confirm('خروج نهایی؟')">تسویه و خروج</a>
+                </div>
             `;
             document.getElementById('ledgerBody').innerHTML = html;
             new bootstrap.Modal(document.getElementById('ledgerModal')).show();
@@ -209,8 +240,14 @@ def dashboard():
     if not session.get('logged_in'): return redirect('/')
     run_accounting()
     conn = get_db_connection()
+    
+    # آمار مالی
+    total_income = conn.execute("SELECT SUM(amount) FROM transactions WHERE type='payment'").fetchone()[0] or 0
+    total_expenses = conn.execute("SELECT SUM(amount) FROM expenses").fetchone()[0] or 0
+    
     rooms = [dict(r) for r in conn.execute("SELECT * FROM rooms ORDER BY floor ASC").fetchall()]
     bookings = [dict(b) for b in conn.execute("SELECT * FROM bookings WHERE is_active=1").fetchall()]
+    
     total_debt = 0
     for r in rooms:
         r['beds'] = []
@@ -225,13 +262,24 @@ def dashboard():
                 r['beds'].append({'status': 'empty', 'num': i})
     
     stats = {
-        'revenue': conn.execute("SELECT SUM(amount) FROM transactions WHERE type='payment' AND date=?", (str(date.today()),)).fetchone()[0] or 0,
+        'total_income': total_income,
+        'total_expenses': total_expenses,
+        'net_profit': total_income - total_expenses,
         'debt': total_debt,
         'count': len(bookings),
         'today': str(date.today())
     }
     conn.close()
     return render_template_string(DASHBOARD_HTML, rooms=rooms, stats=stats)
+
+@app.route('/action/expense', methods=['POST'])
+def action_expense():
+    conn = get_db_connection()
+    conn.execute("INSERT INTO expenses (title, amount, date, category) VALUES (?, ?, ?, ?)",
+                 (request.form['title'], int(request.form['amount']), str(date.today()), request.form['category']))
+    conn.commit()
+    conn.close()
+    return redirect('/dashboard')
 
 @app.route('/api/guest/<int:bid>')
 def api_guest(bid):
@@ -252,6 +300,7 @@ def action_checkin():
     if pay > 0:
         conn.execute("INSERT INTO transactions (booking_id, type, amount, date, description) VALUES (?, 'payment', ?, ?, ?)", (bid, pay, str(date.today()), "پیش‌پرداخت ورود"))
     conn.commit()
+    conn.close()
     return redirect('/dashboard')
 
 @app.route('/action/pay', methods=['POST'])
@@ -259,6 +308,7 @@ def action_pay():
     conn = get_db_connection()
     conn.execute("INSERT INTO transactions (booking_id, type, amount, date, description) VALUES (?, 'payment', ?, ?, ?)", (request.form['bid'], int(request.form['amount']), str(date.today()), "دریافت وجه"))
     conn.commit()
+    conn.close()
     return redirect('/dashboard')
 
 @app.route('/action/checkout/<int:bid>')
@@ -266,41 +316,33 @@ def action_checkout(bid):
     conn = get_db_connection()
     conn.execute("UPDATE bookings SET is_active=0, last_charge_date=? WHERE id=?", (str(date.today()), bid))
     conn.commit()
+    conn.close()
     return redirect('/dashboard')
 
 @app.route('/report/all')
 def report_all():
-    if not session.get('logged_in'): return redirect('/')
     conn = get_db_connection()
-    guests = conn.execute("""SELECT b.*, r.name as rname FROM bookings b 
-                           JOIN rooms r ON b.room_id = r.id 
-                           WHERE b.is_active = 1""").fetchall()
+    guests = conn.execute("SELECT b.*, r.name as rname FROM bookings b JOIN rooms r ON b.room_id = r.id WHERE b.is_active = 1").fetchall()
     html = """
     <body style="font-family:tahoma; direction:rtl; padding:30px;">
-        <h2>گزارش کل مسافران مقیم - مورخ {{ today }}</h2>
+        <h2>گزارش مسافران مقیم - {{ today }}</h2>
         <table border="1" style="width:100%; border-collapse:collapse; text-align:center;">
-            <tr style="background:#eee;">
-                <th>نام</th><th>پاسپورت</th><th>اتاق</th><th>تخت</th><th>تاریخ ورود</th><th>مانده بدهی</th>
-            </tr>
+            <tr><th>نام</th><th>پاسپورت</th><th>اتاق</th><th>تاریخ ورود</th></tr>
             {% for g in guests %}
-            <tr>
-                <td>{{ g.customer_name }}</td><td>{{ g.passport }}</td><td>{{ g.rname }}</td>
-                <td>{{ g.bed_number }}</td><td>{{ g.checkin_date }}</td><td>...</td>
-            </tr>
+            <tr><td>{{ g.customer_name }}</td><td>{{ g.passport }}</td><td>{{ g.rname }}</td><td>{{ g.checkin_date }}</td></tr>
             {% endfor %}
         </table>
-        <button onclick="window.print()" style="margin-top:20px; padding:10px 20px;">پرینت گزارش</button>
-    </body>
-    """
+        <br><button onclick="window.print()">پرینت</button>
+    </body>"""
     return render_template_string(html, guests=guests, today=date.today())
 
 LOGIN_HTML = """
-<body style="background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh; font-family:tahoma;">
+<body style="background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh; font-family:tahoma; direction:rtl;">
     <form action="/login" method="POST" style="background:white; padding:40px; border-radius:15px; box-shadow:0 10px 20px rgba(0,0,0,0.1);">
-        <h3>ورود به پنل هاستل</h3>
-        <input name="u" placeholder="نام کاربری" style="display:block; width:250px; margin:10px 0; padding:10px;">
-        <input name="p" type="password" placeholder="رمز عبور" style="display:block; width:250px; margin:10px 0; padding:10px;">
-        <button style="width:100%; padding:10px; background:#4361ee; color:white; border:none; border-radius:5px;">ورود</button>
+        <h3 class="mb-3">ورود به پنل هاستل</h3>
+        <input name="u" placeholder="نام کاربری" style="display:block; width:250px; margin:10px 0; padding:10px; border:1px solid #ddd;">
+        <input name="p" type="password" placeholder="رمز عبور" style="display:block; width:250px; margin:10px 0; padding:10px; border:1px solid #ddd;">
+        <button style="width:100%; padding:10px; background:#4361ee; color:white; border:none; border-radius:5px; cursor:pointer;">ورود به سیستم</button>
     </form>
 </body>
 """
