@@ -1,249 +1,294 @@
-from flask import Flask, request, redirect, session, render_template_string, jsonify
-import sqlite3
-from datetime import datetime, date, timedelta
 import os
+import sqlite3
+import logging
+from datetime import datetime, date, timedelta
+from flask import Flask, request, redirect, session, jsonify, render_template_string
+
+# تنظیمات لاگ برای عیب‌یابی در سرور
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = "fin-tech-hostel-key-2026"
-DB = "hostel_erp.db"
+app.secret_key = os.environ.get("SECRET_KEY", "hostel-super-secure-key-2026")
+DB_PATH = "hostel_main.db"
 
-# ================= DATABASE & INIT =================
-def get_db():
-    conn = sqlite3.connect(DB)
+# ---------------------------------------------------------
+# DATABASE LAYER
+# ---------------------------------------------------------
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    with get_db() as conn:
-        # ساختار اتاق‌ها
+    with get_db_connection() as conn:
+        # جدول اتاق‌ها
         conn.execute("""CREATE TABLE IF NOT EXISTS rooms (
-            id INTEGER PRIMARY KEY, name TEXT, capacity INTEGER, 
-            base_price INTEGER, room_type TEXT)""")
-        
-        # ساختار رزروها
-        conn.execute("""CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY, room_id INTEGER, bed_number INTEGER, 
-            customer_name TEXT, whatsapp TEXT, checkin_date TEXT, 
-            checkout_date TEXT, daily_rate INTEGER, is_active INTEGER DEFAULT 1,
-            last_charge_date TEXT)""")
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            capacity INTEGER NOT NULL,
+            base_price INTEGER DEFAULT 0,
+            room_type TEXT)""")
 
-        # ساختار تراکنش‌های مالی
+        # جدول رزروها (پرونده مشتری)
+        conn.execute("""CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            room_id INTEGER,
+            bed_number INTEGER,
+            customer_name TEXT NOT NULL,
+            whatsapp TEXT,
+            checkin_date TEXT,
+            checkout_date TEXT,
+            last_charge_date TEXT,
+            daily_rate INTEGER,
+            is_active INTEGER DEFAULT 1,
+            FOREIGN KEY(room_id) REFERENCES rooms(id))""")
+
+        # جدول تراکنش‌های مالی (Ledger)
         conn.execute("""CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY, booking_id INTEGER, type TEXT, 
-            amount INTEGER, date TEXT, description TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER,
+            type TEXT CHECK(type IN ('charge', 'payment', 'discount')),
+            amount INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            description TEXT,
             FOREIGN KEY(booking_id) REFERENCES bookings(id))""")
 
-        # داده‌های اولیه اتاق‌ها در صورت خالی بودن دیتابیس
+        # درج داده‌های اولیه تست در صورت خالی بودن
         if conn.execute("SELECT count(*) FROM rooms").fetchone()[0] == 0:
             rooms_data = [
-                ("اتاق ۱۰۱ (VIP)", 1, 180000, "خصوصی"),
-                ("اتاق ۱۰۲ (۴ تخته)", 4, 35000, "عمومی"),
-                ("اتاق ۱۰۳ (۸ تخته)", 8, 25000, "اقتصادی")
+                ('VIP 101', 1, 500000, 'خصوصی'),
+                ('Dorm 102', 4, 150000, 'عمومی'),
+                ('Dorm 103', 8, 120000, 'اقتصادی'),
+                ('Boutique 104', 2, 350000, 'نیمه خصوصی')
             ]
             conn.executemany("INSERT INTO rooms (name, capacity, base_price, room_type) VALUES (?,?,?,?)", rooms_data)
+        conn.commit()
 
-init_db()
-
-# ================= CORE LOGIC (ACCOUNTING) =================
-def sync_daily_charges():
-    """محاسبه خودکار بدهی روزانه برای تمام مسافران مقیم تا امروز"""
-    db = get_db()
-    active_bookings = db.execute("SELECT * FROM bookings WHERE is_active = 1").fetchall()
+# ---------------------------------------------------------
+# ACCOUNTING ENGINE
+# ---------------------------------------------------------
+def run_daily_accounting():
+    """قلب تپنده سیستم: محاسبه بدهی روزانه مسافران"""
+    conn = get_db_connection()
     today = date.today()
-
-    for b in active_bookings:
-        last_charge = datetime.strptime(b['last_charge_date'], '%Y-%m-%d').date()
-        days_to_charge = (today - last_charge).days
-
-        if days_to_charge > 0:
-            for i in range(1, days_to_charge + 1):
-                charge_date = last_charge + timedelta(days=i)
-                db.execute("""INSERT INTO transactions (booking_id, type, amount, date, description) 
-                           VALUES (?, 'charge', ?, ?, ?)""", 
-                           (b['id'], b['daily_rate'], str(charge_date), f"شارژ اقامت روز {charge_date}"))
+    active_guests = conn.execute("SELECT * FROM bookings WHERE is_active = 1").fetchall()
+    
+    for guest in active_guests:
+        last_date = datetime.strptime(guest['last_charge_date'], '%Y-%m-%d').date()
+        diff = (today - last_date).days
+        
+        if diff > 0:
+            for i in range(1, diff + 1):
+                charge_day = last_date + timedelta(days=i)
+                conn.execute("""INSERT INTO transactions (booking_id, type, amount, date, description)
+                             VALUES (?, 'charge', ?, ?, ?)""",
+                             (guest['id'], guest['daily_rate'], str(charge_day), f"اجاره روزانه {charge_day}"))
             
-            db.execute("UPDATE bookings SET last_charge_date = ? WHERE id = ?", (str(today), b['id']))
-    db.commit()
+            conn.execute("UPDATE bookings SET last_charge_date = ? WHERE id = ?", (str(today), guest['id']))
+    conn.commit()
+    conn.close()
 
-def get_booking_balance(booking_id):
-    db = get_db()
-    charges = db.execute("SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type='charge'", (booking_id,)).fetchone()[0] or 0
-    payments = db.execute("SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type='payment'", (booking_id,)).fetchone()[0] or 0
-    return charges - payments
+def get_balance(booking_id):
+    conn = get_db_connection()
+    c = conn.execute("SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type='charge'", (booking_id,)).fetchone()[0] or 0
+    p = conn.execute("SELECT SUM(amount) FROM transactions WHERE booking_id=? AND type IN ('payment', 'discount')", (booking_id,)).fetchone()[0] or 0
+    conn.close()
+    return c - p
 
-# ================= ROUTES =================
-@app.route("/")
-def index():
-    if not session.get("login"):
-        return '''<body style="direction:rtl; font-family:tahoma; background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh;">
-            <form action="/login" method="POST" style="background:white; padding:40px; border-radius:20px; box-shadow:0 10px 25px rgba(0,0,0,0.1);">
-                <h2 style="margin-bottom:20px;">مدیریت هوشمند هاستل</h2>
-                <input name="u" placeholder="نام کاربری" style="display:block; width:100%; padding:10px; margin-bottom:10px; border:1px solid #ddd; border-radius:8px;">
-                <input name="p" type="password" placeholder="رمز عبور" style="display:block; width:100%; padding:10px; margin-bottom:20px; border:1px solid #ddd; border-radius:8px;">
-                <button style="width:100%; padding:12px; background:#4361ee; color:white; border:none; border-radius:8px; cursor:pointer;">ورود به سیستم</button>
-            </form></body>'''
-    return redirect("/dashboard")
+# ---------------------------------------------------------
+# WEB ROUTES
+# ---------------------------------------------------------
+@app.route('/')
+def login_page():
+    if session.get('logged_in'): return redirect('/dashboard')
+    return render_template_string(LOGIN_HTML)
 
-@app.route("/login", methods=["POST"])
-def login():
-    if request.form["u"] == "admin" and request.form["p"] == "admin123":
-        session["login"] = True
-    return redirect("/dashboard")
+@app.route('/login', methods=['POST'])
+def do_login():
+    if request.form.get('u') == 'admin' and request.form.get('p') == 'admin123':
+        session['logged_in'] = True
+        return redirect('/dashboard')
+    return "خطا در ورود!"
 
-@app.route("/logout")
-def logout():
+@app.route('/logout')
+def do_logout():
     session.clear()
-    return redirect("/")
+    return redirect('/')
 
-@app.route("/dashboard")
+@app.route('/dashboard')
 def dashboard():
-    if not session.get("login"): return redirect("/")
-    sync_daily_charges()
+    if not session.get('logged_in'): return redirect('/')
+    run_daily_accounting()
     
-    db = get_db()
-    rooms = [dict(r) for r in db.execute("SELECT * FROM rooms").fetchall()]
-    all_bookings = [dict(b) for b in db.execute("SELECT * FROM bookings WHERE is_active=1").fetchall()]
+    conn = get_db_connection()
+    rooms = [dict(r) for r in conn.execute("SELECT * FROM rooms").fetchall()]
+    bookings = [dict(b) for b in conn.execute("SELECT * FROM bookings WHERE is_active=1").fetchall()]
     
-    total_debt = 0
+    total_receivable = 0
     for r in rooms:
         r['beds'] = []
         for i in range(1, r['capacity'] + 1):
-            booking = next((b for b in all_bookings if b['room_id'] == r['id'] and b['bed_number'] == i), None)
-            if booking:
-                balance = get_booking_balance(booking['id'])
-                booking['balance'] = balance
-                if balance > 0: total_debt += balance
-                r['beds'].append({'status': 'occupied', 'data': booking})
+            b_data = next((b for b in bookings if b['room_id'] == r['id'] and b['bed_number'] == i), None)
+            if b_data:
+                bal = get_balance(b_data['id'])
+                b_data['balance'] = bal
+                if bal > 0: total_receivable += bal
+                r['beds'].append({'status': 'occupied', 'info': b_data})
             else:
-                r['beds'].append({'status': 'empty', 'bed_num': i})
+                r['beds'].append({'status': 'empty', 'num': i})
     
     stats = {
-        "daily_revenue": db.execute("SELECT SUM(amount) FROM transactions WHERE type='payment' AND date=?", (str(date.today()),)).fetchone()[0] or 0,
-        "total_debt": total_debt,
-        "active_guests": len(all_bookings)
+        'revenue': conn.execute("SELECT SUM(amount) FROM transactions WHERE type='payment' AND date=?", (str(date.today()),)).fetchone()[0] or 0,
+        'debt': total_receivable,
+        'count': len(bookings)
     }
-    return render_template_string(dashboard_html, rooms=rooms, stats=stats)
+    conn.close()
+    return render_template_string(DASHBOARD_HTML, rooms=rooms, stats=stats)
 
-@app.route("/api/booking/<int:bid>")
-def get_booking_details(bid):
-    db = get_db()
-    booking = dict(db.execute("SELECT * FROM bookings WHERE id=?", (bid,)).fetchone())
-    ledger = [dict(t) for t in db.execute("SELECT * FROM transactions WHERE booking_id=? ORDER BY date DESC", (bid,)).fetchall()]
-    balance = get_booking_balance(bid)
-    return jsonify({'booking': booking, 'ledger': ledger, 'balance': balance})
+@app.route('/api/guest/<int:bid>')
+def api_guest(bid):
+    conn = get_db_connection()
+    guest = dict(conn.execute("SELECT * FROM bookings WHERE id=?", (bid,)).fetchone())
+    ledger = [dict(t) for t in conn.execute("SELECT * FROM transactions WHERE booking_id=? ORDER BY id DESC", (bid,)).fetchall()]
+    conn.close()
+    return jsonify({'guest': guest, 'ledger': ledger, 'balance': get_balance(bid)})
 
-@app.route("/action/checkin", methods=["POST"])
+@app.route('/action/checkin', methods=['POST'])
 def action_checkin():
-    db = get_db()
-    c_date = str(date.today())
-    cursor = db.execute("""INSERT INTO bookings 
-        (room_id, bed_number, customer_name, whatsapp, checkin_date, last_charge_date, daily_rate) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (request.form['room_id'], request.form['bed_num'], request.form['name'], 
-         request.form['whatsapp'], c_date, c_date, request.form['rate']))
+    today = str(date.today())
+    conn = get_db_connection()
+    cur = conn.execute("""INSERT INTO bookings (room_id, bed_number, customer_name, whatsapp, checkin_date, last_charge_date, daily_rate)
+                 VALUES (?,?,?,?,?,?,?)""", 
+                 (request.form['rid'], request.form['bnum'], request.form['name'], 
+                  request.form['phone'], today, today, request.form['rate']))
     
-    booking_id = cursor.lastrowid
-    payment = int(request.form.get('payment', 0))
-    if payment > 0:
-        db.execute("INSERT INTO transactions (booking_id, type, amount, date, description) VALUES (?, 'payment', ?, ?, ?)", 
-                   (booking_id, payment, c_date, "پیش‌پرداخت هنگام پذیرش"))
-    db.commit()
-    return redirect("/dashboard")
+    bid = cur.lastrowid
+    pay = int(request.form.get('payment', 0))
+    if pay > 0:
+        conn.execute("INSERT INTO transactions (booking_id, type, amount, date, description) VALUES (?, 'payment', ?, ?, ?)",
+                     (bid, pay, today, "پیش‌پرداخت ورود"))
+    conn.commit()
+    return redirect('/dashboard')
 
-@app.route("/action/add-payment", methods=["POST"])
-def add_payment():
-    db = get_db()
-    db.execute("INSERT INTO transactions (booking_id, type, amount, date, description) VALUES (?, 'payment', ?, ?, ?)", 
-               (request.form['booking_id'], int(request.form['amount']), str(date.today()), "دریافت نقدی / کارت"))
-    db.commit()
-    return redirect("/dashboard")
+@app.route('/action/pay', methods=['POST'])
+def action_pay():
+    conn = get_db_connection()
+    conn.execute("INSERT INTO transactions (booking_id, type, amount, date, description) VALUES (?, 'payment', ?, ?, ?)",
+                 (request.form['bid'], int(request.form['amount']), str(date.today()), "دریافت وجه نقد/کارت"))
+    conn.commit()
+    return redirect('/dashboard')
 
-@app.route("/action/checkout/<int:bid>")
+@app.route('/action/checkout/<int:bid>')
 def action_checkout(bid):
-    db = get_db()
-    db.execute("UPDATE bookings SET is_active=0, checkout_date=? WHERE id=?", (str(date.today()), bid))
-    db.commit()
-    return redirect("/dashboard")
+    conn = get_db_connection()
+    conn.execute("UPDATE bookings SET is_active=0, checkout_date=? WHERE id=?", (str(date.today()), bid))
+    conn.commit()
+    return redirect('/dashboard')
 
-# ================= UI DESIGN (HTML) =================
-dashboard_html = """
+# ---------------------------------------------------------
+# STARTUP
+# ---------------------------------------------------------
+if __name__ == '__main__':
+    init_db()
+    # تنظیم پورت برای رندر (Render) یا لوکال
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+    LOGIN_HTML = """
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <title>پنل هوشمند هاستل</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;500;800&display=swap');
-        :root { --primary: #635bff; --bg: #f8fafc; }
-        body { background: var(--bg); font-family: 'Vazirmatn', sans-serif; padding-top: 20px; }
-        .sidebar { width: 260px; height: 100vh; position: fixed; right: 0; top: 0; background: white; border-left: 1px solid #e2e8f0; padding: 25px; }
-        .main-content { margin-right: 260px; padding: 0 30px 50px 30px; }
-        .stat-card { background: white; border-radius: 15px; padding: 20px; border: 1px solid #e2e8f0; }
-        .room-section { background: white; border-radius: 15px; padding: 20px; margin-bottom: 25px; border: 1px solid #e2e8f0; }
-        .bed-unit { 
-            width: 130px; height: 140px; border-radius: 12px; border: 2px dashed #cbd5e1; 
-            display: flex; flex-direction: column; align-items: center; justify-content: center; 
-            cursor: pointer; transition: 0.2s; background: #fff; position: relative;
-        }
-        .bed-unit.occupied { border: 2px solid var(--primary); background: #f8faff; }
-        .balance-badge { position: absolute; bottom: 8px; font-size: 10px; padding: 2px 8px; border-radius: 20px; }
-        .debt { background: #fee2e2; color: #ef4444; }
-        .credit { background: #dcfce7; color: #22c55e; }
-        .settled { background: #f1f5f9; color: #64748b; }
-        .ledger-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
+        body { background: #f0f2f5; font-family: tahoma; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-box { background: white; padding: 40px; border-radius: 15px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); width: 320px; }
+        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #4361ee; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; }
     </style>
 </head>
 <body>
-    <aside class="sidebar">
-        <h4 class="fw-bold text-primary mb-4">هاستل سیستم</h4>
-        <nav class="nav flex-column gap-2">
-            <a href="/dashboard" class="nav-link active"><i class="fas fa-home me-2"></i> داشبورد مدیریتی</a>
-            <a href="#" class="nav-link text-muted"><i class="fas fa-users me-2"></i> لیست تمام مهمانان</a>
-            <a href="/logout" class="nav-link text-danger mt-5"><i class="fas fa-power-off me-2"></i> خروج</a>
-        </nav>
-    </aside>
+    <div class="login-box">
+        <h2 style="text-align: center; color: #333;">ورود به هاستل</h2>
+        <form action="/login" method="POST">
+            <input name="u" placeholder="نام کاربری" required>
+            <input name="p" type="password" placeholder="رمز عبور" required>
+            <button type="submit">ورود به پنل</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
 
-    <main class="main-content">
-        <div class="row g-4 mb-4">
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>پنل مدیریت هاستل</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700&display=swap');
+        body { font-family: 'Vazirmatn', sans-serif; background: #f8f9fa; }
+        .stat-card { border: none; border-radius: 15px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); transition: 0.3s; }
+        .room-box { background: white; border-radius: 15px; padding: 20px; margin-bottom: 25px; border: 1px solid #eee; }
+        .bed { 
+            width: 120px; height: 120px; border-radius: 15px; border: 2px dashed #ccc; 
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            cursor: pointer; position: relative; background: white;
+        }
+        .bed.occupied { border: 2px solid #4361ee; background: #f0f3ff; }
+        .bed-badge { position: absolute; bottom: 8px; font-size: 10px; padding: 2px 8px; border-radius: 10px; }
+        .bg-debt { background: #ffe5e5; color: #d00; }
+        .bg-settled { background: #e5ffed; color: #00802b; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-dark bg-primary mb-4">
+        <div class="container">
+            <span class="navbar-brand fw-bold">HOSTEL ERP v2026</span>
+            <a href="/logout" class="btn btn-outline-light btn-sm">خروج</a>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="row g-3 mb-5">
             <div class="col-md-4">
-                <div class="stat-card">
-                    <small class="text-muted">وصولی نقدی امروز</small>
-                    <h3 class="fw-bold text-success">{{ "{:,.0f}".format(stats.daily_revenue) }}</h3>
+                <div class="stat-card card p-3 text-center">
+                    <small class="text-muted">وصولی امروز</small>
+                    <h3 class="fw-bold text-success">{{ "{:,.0f}".format(stats.revenue) }}</h3>
                 </div>
             </div>
             <div class="col-md-4">
-                <div class="stat-card">
-                    <small class="text-muted">کل مطالبات لحظه‌ای</small>
-                    <h3 class="fw-bold text-danger">{{ "{:,.0f}".format(stats.total_debt) }}</h3>
+                <div class="stat-card card p-3 text-center">
+                    <small class="text-muted">مطالبات کل (بدهکاران)</small>
+                    <h3 class="fw-bold text-danger">{{ "{:,.0f}".format(stats.debt) }}</h3>
                 </div>
             </div>
             <div class="col-md-4">
-                <div class="stat-card">
-                    <small class="text-muted">تخت‌های اشغال شده</small>
-                    <h3 class="fw-bold">{{ stats.active_guests }} تخت</h3>
+                <div class="stat-card card p-3 text-center">
+                    <small class="text-muted">مهمانان مقیم</small>
+                    <h3 class="fw-bold">{{ stats.count }} نفر</h3>
                 </div>
             </div>
         </div>
 
-        <h5 class="fw-bold mb-3">نقشه اتاق‌ها و وضعیت تخت‌ها</h5>
         {% for room in rooms %}
-        <div class="room-section">
-            <h6 class="fw-bold mb-3">{{ room.name }} <span class="badge bg-light text-muted">{{ room.room_type }}</span></h6>
+        <div class="room-box">
+            <h5 class="fw-bold mb-3 border-bottom pb-2">{{ room.name }} <small class="text-muted fs-6">({{ room.room_type }})</small></h5>
             <div class="d-flex flex-wrap gap-3">
                 {% for bed in room.beds %}
                     {% if bed.status == 'empty' %}
-                    <div class="bed-unit" onclick="openCheckin({{ room.id }}, {{ bed.bed_num }}, {{ room.base_price }})">
-                        <i class="fas fa-plus text-muted mb-2"></i>
-                        <span class="small">تخت {{ bed.bed_num }}</span>
+                    <div class="bed" onclick="openCheckin({{ room.id }}, {{ bed.num }}, {{ room.base_price }})">
+                        <i class="fa fa-plus text-muted mb-2"></i>
+                        <small>تخت {{ bed.num }}</small>
                     </div>
                     {% else %}
-                    <div class="bed-unit occupied" onclick="openLedger({{ bed.data.id }})">
-                        <i class="fas fa-user text-primary mb-2"></i>
-                        <span class="small fw-bold">{{ bed.data.customer_name[:15] }}</span>
-                        <span class="balance-badge {% if bed.data.balance > 0 %}debt{% elif bed.data.balance < 0 %}credit{% else %}settled{% endif %}">
-                            {{ "{:,.0f}".format(bed.data.balance|abs) if bed.data.balance != 0 else 'تسویه' }}
+                    <div class="bed occupied" onclick="openLedger({{ bed.info.id }})">
+                        <i class="fa fa-user text-primary mb-1"></i>
+                        <small class="fw-bold text-center px-1">{{ bed.info.customer_name[:12] }}</small>
+                        <span class="bed-badge {{ 'bg-debt' if bed.info.balance > 0 else 'bg-settled' }}">
+                            {{ "{:,.0f}".format(bed.info.balance|abs) if bed.info.balance != 0 else 'تسویه' }}
                         </span>
                     </div>
                     {% endif %}
@@ -251,79 +296,70 @@ dashboard_html = """
             </div>
         </div>
         {% endfor %}
-    </main>
+    </div>
 
     <div class="modal fade" id="checkinModal" tabindex="-1">
         <div class="modal-dialog modal-dialog-centered">
-            <form action="/action/checkin" method="POST" class="modal-content border-0 p-4 rounded-4">
-                <input type="hidden" name="room_id" id="m_room_id">
-                <input type="hidden" name="bed_num" id="m_bed_num">
-                <h5 class="fw-bold mb-3">پذیرش سریع مسافر</h5>
+            <form action="/action/checkin" method="POST" class="modal-content p-4 border-0 shadow rounded-4">
+                <input type="hidden" name="rid" id="in_rid">
+                <input type="hidden" name="bnum" id="in_bnum">
+                <h5 class="fw-bold mb-3">پذیرش تخت جدید</h5>
                 <input type="text" name="name" class="form-control mb-2" placeholder="نام مسافر" required>
-                <input type="text" name="whatsapp" class="form-control mb-2" placeholder="واتس‌اپ">
+                <input type="text" name="phone" class="form-control mb-2" placeholder="شماره تماس">
                 <div class="row g-2">
-                    <div class="col-6"><input type="number" name="rate" id="m_rate" class="form-control" placeholder="نرخ شبی"></div>
+                    <div class="col-6"><input type="number" name="rate" id="in_rate" class="form-control" placeholder="نرخ شبانه"></div>
                     <div class="col-6"><input type="number" name="payment" class="form-control" placeholder="دریافتی اول"></div>
                 </div>
-                <button class="btn btn-primary w-100 mt-3 py-2 fw-bold">ثبت و ورود</button>
+                <button class="btn btn-primary w-100 mt-3 fw-bold py-2">ثبت ورود</button>
             </form>
         </div>
     </div>
 
     <div class="modal fade" id="ledgerModal" tabindex="-1">
-        <div class="modal-dialog modal-dialog-centered modal-lg">
-            <div class="modal-content border-0 p-4 rounded-4" id="ledgerContent">
-                </div>
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content p-4" id="ledgerBody"></div>
         </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         function openCheckin(rid, bnum, rate) {
-            document.getElementById('m_room_id').value = rid;
-            document.getElementById('m_bed_num').value = bnum;
-            document.getElementById('m_rate').value = rate;
+            document.getElementById('in_rid').value = rid;
+            document.getElementById('in_bnum').value = bnum;
+            document.getElementById('in_rate').value = rate;
             new bootstrap.Modal(document.getElementById('checkinModal')).show();
         }
 
         async function openLedger(bid) {
-            const res = await fetch('/api/booking/' + bid);
-            const data = await res.json();
-            const b = data.booking;
-            
+            const res = await fetch('/api/guest/' + bid);
+            const d = await res.json();
             let html = `
-                <div class="d-flex justify-content-between align-items-center mb-4">
-                    <div>
-                        <h4 class="fw-bold mb-0">${b.customer_name}</h4>
-                        <small class="text-muted">ورود: ${b.checkin_date} | نرخ: ${b.daily_rate} تومان</small>
-                    </div>
-                    <span class="badge ${data.balance > 0 ? 'bg-danger' : 'bg-success'} fs-5">مانده: ${Math.abs(data.balance)}</span>
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h4 class="fw-bold m-0">${d.guest.customer_name}</h4>
+                    <span class="badge ${d.balance > 0 ? 'bg-danger' : 'bg-success'} fs-5">مانده: ${Math.abs(d.balance).toLocaleString()}</span>
                 </div>
-                <div style="max-height: 250px; overflow-y: auto" class="mb-3">
-                    ${data.ledger.map(t => `
-                        <div class="ledger-row">
-                            <span>${t.description} <small class="text-muted">${t.date}</small></span>
-                            <span class="${t.type=='charge'?'text-warning':'text-success'} fw-bold">${t.type=='charge'?'+':'-'}${t.amount}</span>
+                <div style="max-height:300px; overflow-y:auto" class="border rounded p-2 mb-3 bg-light">
+                    ${d.ledger.map(t => `
+                        <div class="d-flex justify-content-between border-bottom py-2 small">
+                            <span>${t.description} <br><small class="text-muted">${t.date}</small></span>
+                            <b class="${t.type=='charge'?'text-danger':'text-success'}">${t.type=='charge'?'+':'-'}${t.amount.toLocaleString()}</b>
                         </div>
                     `).join('')}
                 </div>
-                <form action="/action/add-payment" method="POST" class="input-group mb-3">
-                    <input type="hidden" name="booking_id" value="${b.id}">
-                    <input type="number" name="amount" class="form-control" placeholder="مبلغ دریافتی جدید..." required>
-                    <button class="btn btn-success">ثبت دریافت</button>
+                <form action="/action/pay" method="POST" class="input-group mb-3">
+                    <input type="hidden" name="bid" value="${d.guest.id}">
+                    <input type="number" name="amount" class="form-control" placeholder="مبلغ دریافتی..." required>
+                    <button class="btn btn-success">ثبت مبلغ</button>
                 </form>
                 <div class="d-flex gap-2">
-                    <button class="btn btn-outline-secondary flex-grow-1">چاپ فاکتور</button>
-                    <a href="/action/checkout/${b.id}" class="btn btn-danger" onclick="return confirm('تسویه نهایی انجام شود؟')">خروج مسافر</a>
+                    <button onclick="window.print()" class="btn btn-light flex-grow-1">چاپ فاکتور</button>
+                    <a href="/action/checkout/${d.guest.id}" class="btn btn-outline-danger" onclick="return confirm('خروج مسافر؟')">تسویه و خروج</a>
                 </div>
             `;
-            document.getElementById('ledgerContent').innerHTML = html;
+            document.getElementById('ledgerBody').innerHTML = html;
             new bootstrap.Modal(document.getElementById('ledgerModal')).show();
         }
     </script>
 </body>
 </html>
-"""
 
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
