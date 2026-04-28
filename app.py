@@ -303,7 +303,7 @@ LOGIN_HTML = """
         <button style="width:100%; padding:10px; background:#4361ee; color:white; border:none; border-radius:5px;">ورود</button>
     </form>
 </body>
-
+"""
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
