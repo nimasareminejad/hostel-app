@@ -16,7 +16,11 @@ def init_db():
         # ساختار پایه اتاق‌ها
         conn.execute("CREATE TABLE IF NOT EXISTS rooms (id INTEGER PRIMARY KEY, floor INT, name TEXT, capacity INT, base_price INT, type TEXT)")
         # سیستم رزرواسیون و اسکان
-        conn.execute("CREATE TABLE IF NOT EXISTS bookings (id INTEGER PRIMARY KEY, room_id INT, bed_number INT, name TEXT, passport TEXT, checkin TEXT, last_charge TEXT, rate INT, active INT DEFAULT 1)")
+        conn.execute("CREATE TABLE IF NOT EXISTS bookings (id INTEGER PRIMARY KEY, room_id INT, bed_number INT, name TEXT, passport TEXT, checkin TEXT, checkout TEXT, last_charge TEXT, rate INT, active INT DEFAULT 1)")
+        # اگر دیتابیس قبلاً با نسخه قدیمی ساخته شده باشد، ستون تاریخ خروج را اضافه می‌کنیم
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(bookings)").fetchall()]
+        if "checkout" not in cols:
+            conn.execute("ALTER TABLE bookings ADD COLUMN checkout TEXT")
         # دفتر روزنامه حسابداری (تمام تراکنش‌ها اینجا ثبت می‌شوند)
         conn.execute("CREATE TABLE IF NOT EXISTS journal (id INTEGER PRIMARY KEY, ref_id INT, type TEXT, category TEXT, amount INT, date TEXT, desc TEXT)")
         
@@ -27,21 +31,66 @@ def init_db():
 
 init_db()
 
+# --- توابع کمکی برای محاسبات مشتری ---
+def _to_date(value, fallback=None):
+    if not value:
+        return fallback
+    try:
+        return datetime.strptime(value, '%Y-%m-%d').date()
+    except Exception:
+        return fallback
+
+def stay_nights(checkin, checkout=None):
+    in_date = _to_date(checkin, date.today())
+    out_date = _to_date(checkout, date.today()) if checkout else date.today()
+    return max((out_date - in_date).days, 1)
+
+def guest_financial_summary(conn, booking):
+    bid = booking['id']
+    rate = int(booking['rate'] or 0)
+    nights = stay_nights(booking['checkin'], booking['checkout'])
+    planned_total = nights * rate
+
+    posted_charges = conn.execute(
+        "SELECT SUM(amount) FROM journal WHERE ref_id=? AND type='DEBIT' AND category='STAY_CHARGE'",
+        (bid,)
+    ).fetchone()[0] or 0
+
+    paid = conn.execute(
+        "SELECT SUM(amount) FROM journal WHERE ref_id=? AND type='CREDIT' AND category='PAYMENT'",
+        (bid,)
+    ).fetchone()[0] or 0
+
+    total = max(planned_total, posted_charges)
+    balance = total - paid
+    return {
+        'nights': nights,
+        'rate': rate,
+        'total': total,
+        'paid': paid,
+        'balance': balance,
+        'checkout_display': booking['checkout'] or str(date.today())
+    }
+
 # --- هسته حسابداری (مشابه سپیدار) ---
 def update_financials():
     conn = get_db()
     today = date.today()
     active_bookings = conn.execute("SELECT * FROM bookings WHERE active = 1").fetchall()
     for b in active_bookings:
-        last = datetime.strptime(b['last_charge'], '%Y-%m-%d').date()
-        diff = (today - last).days
+        last = _to_date(b['last_charge'], _to_date(b['checkin'], today))
+        charge_until = today
+        checkout_date = _to_date(b['checkout'])
+        if checkout_date and checkout_date < today:
+            charge_until = checkout_date
+        diff = (charge_until - last).days
         if diff > 0:
             for i in range(1, diff + 1):
                 day = last + timedelta(days=i)
                 # ثبت سند هزینه اقامت در دفتر روزنامه
                 conn.execute("INSERT INTO journal (ref_id, type, category, amount, date, desc) VALUES (?, 'DEBIT', 'STAY_CHARGE', ?, ?, ?)", 
                              (b['id'], b['rate'], str(day), f"هزینه اقامت شب {day}"))
-            conn.execute("UPDATE bookings SET last_charge = ? WHERE id = ?", (str(today), b['id']))
+            conn.execute("UPDATE bookings SET last_charge = ? WHERE id = ?", (str(charge_until), b['id']))
     conn.commit()
 
 # --- UI (ثابت و کاربردی) ---
@@ -54,9 +103,14 @@ UI = """
     <style>
         body { font-family: tahoma; background: #f4f7f6; }
         .stat-box { background: white; padding: 20px; border-radius: 10px; border-bottom: 5px solid #222; }
-        .bed { width: 70px; height: 70px; border-radius: 8px; border: 1px solid #ccc; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; margin: 4px; background: #fff; font-size: 11px; vertical-align: top; }
+        .bed { width: 165px; min-height: 145px; border-radius: 10px; border: 1px solid #ccc; display: inline-flex; flex-direction: column; align-items: stretch; justify-content: flex-start; cursor: pointer; margin: 5px; background: #fff; font-size: 11px; vertical-align: top; padding: 8px; line-height: 1.7; text-align: right; }
+        .bed-empty { align-items: center; justify-content: center; text-align: center; min-height: 75px; }
         .occupied { background: #0d6efd; color: white; border: none; }
-        .debtor { border: 2px solid #dc3545 !important; }
+        .debtor { border: 3px solid #dc3545 !important; box-shadow: 0 0 0 2px rgba(220,53,69,.15); }
+        .settled { border: 3px solid #198754 !important; }
+        .bed-title { font-weight: bold; font-size: 12px; border-bottom: 1px solid rgba(255,255,255,.35); margin-bottom: 4px; padding-bottom: 3px; }
+        .bed-row { display: flex; justify-content: space-between; gap: 6px; }
+        .money { direction: ltr; unicode-bidi: plaintext; }
     </style>
 </head>
 <body>
@@ -90,10 +144,15 @@ UI = """
                     <div>
                         {% for b in r.beds %}
                             {% if b.status == 'empty' %}
-                            <div class="bed" onclick="openCheckin({{ r.id }}, {{ b.num }}, {{ r.base_price }})">تخت {{ b.num }}<br>خالی</div>
+                            <div class="bed bed-empty" onclick="openCheckin({{ r.id }}, {{ b.num }}, {{ r.base_price }})">تخت {{ b.num }}<br>خالی</div>
                             {% else %}
-                            <div class="bed occupied {{ 'debtor' if b.info.bal > 0 }}" onclick="openLedger({{ b.info.id }})">
-                                {{ b.info.name[:10] }}<br>{{ "{:,}".format(b.info.bal) if b.info.bal > 0 else 'تصفیه' }}
+                            <div class="bed occupied {{ 'debtor' if b.info.balance > 0 else 'settled' }}" onclick="openLedger({{ b.info.id }})">
+                                <div class="bed-title">{{ b.info.name[:18] }}</div>
+                                <div class="bed-row"><span>ورود:</span><b>{{ b.info.checkin }}</b></div>
+                                <div class="bed-row"><span>خروج:</span><b>{{ b.info.checkout_display }}</b></div>
+                                <div class="bed-row"><span>قیمت کل:</span><b class="money">{{ "{:,}".format(b.info.total) }}</b></div>
+                                <div class="bed-row"><span>پرداختی:</span><b class="money">{{ "{:,}".format(b.info.paid) }}</b></div>
+                                <div class="bed-row"><span>مانده:</span><b class="money">{{ "{:,}".format(b.info.balance) }}</b></div>
                             </div>
                             {% endif %}
                         {% endfor %}
@@ -119,7 +178,9 @@ UI = """
         <input name="name" placeholder="نام مسافر" class="form-control mb-2" required>
         <input name="passport" placeholder="کد ملی / پاسپورت" class="form-control mb-2" required>
         <div class="row g-2 mb-3">
-            <div class="col-6"><label class="small">نرخ شبانه</label><input name="rate" id="in_rate" type="number" class="form-control"></div>
+            <div class="col-6"><label class="small">تاریخ ورود</label><input name="checkin" type="date" class="form-control" value="{{ today }}" required></div>
+            <div class="col-6"><label class="small">تاریخ خروج</label><input name="checkout" type="date" class="form-control"></div>
+            <div class="col-6"><label class="small">نرخ شبانه</label><input name="rate" id="in_rate" type="number" class="form-control" required></div>
             <div class="col-6"><label class="small">دریافت اول (بیعانه)</label><input name="pay" type="number" class="form-control" value="0"></div>
         </div>
         <button class="btn btn-primary w-100">صدور فاکتور و اسکان</button>
@@ -134,12 +195,31 @@ UI = """
             document.getElementById('in_rid').value=rid; document.getElementById('in_bnum').value=bnum; document.getElementById('in_rate').value=rate;
             new bootstrap.Modal(document.getElementById('checkinModal')).show();
         }
+        function toman(n) { return Number(n || 0).toLocaleString(); }
+
         async function openLedger(bid) {
             const r = await fetch('/api/guest/' + bid); const d = await r.json();
-            let html = `<div class="d-flex justify-content-between"><h4>صورتحساب: ${d.g.name}</h4><h4 class="text-danger">${d.bal.toLocaleString()} بدهی</h4></div>
+            let html = `<div class="d-flex justify-content-between align-items-start gap-3">
+                <div>
+                    <h4>صورتحساب: ${d.g.name}</h4>
+                    <div class="text-muted">کد ملی / پاسپورت: ${d.g.passport || '-'}</div>
+                </div>
+                <h4 class="${d.balance > 0 ? 'text-danger' : 'text-success'}">${toman(d.balance)} مانده</h4>
+            </div>
+
+            <div class="row g-2 my-3">
+                <div class="col-md-3"><div class="border rounded p-2 bg-light"><small>تاریخ ورود</small><br><b>${d.g.checkin}</b></div></div>
+                <div class="col-md-3"><div class="border rounded p-2 bg-light"><small>تاریخ خروج</small><br><b>${d.summary.checkout_display}</b></div></div>
+                <div class="col-md-3"><div class="border rounded p-2 bg-light"><small>تعداد شب</small><br><b>${d.summary.nights}</b></div></div>
+                <div class="col-md-3"><div class="border rounded p-2 bg-light"><small>نرخ شبانه</small><br><b>${toman(d.summary.rate)}</b></div></div>
+                <div class="col-md-4"><div class="border rounded p-2"><small>قیمت کل آن بازه</small><br><b>${toman(d.summary.total)}</b></div></div>
+                <div class="col-md-4"><div class="border rounded p-2"><small>جمع پرداختی</small><br><b class="text-success">${toman(d.summary.paid)}</b></div></div>
+                <div class="col-md-4"><div class="border rounded p-2"><small>باقی‌مانده پرداختی</small><br><b class="${d.balance > 0 ? 'text-danger' : 'text-success'}">${toman(d.balance)}</b></div></div>
+            </div>
+
             <div style="max-height:300px; overflow-y:auto" class="border p-2 my-3 bg-light">
-                <table class="table table-sm"><thead><tr><th>تاریخ</th><th>شرح</th><th>مبلغ</th></tr></thead>
-                <tbody>${d.l.map(t => `<tr><td>${t.date}</td><td>${t.desc}</td><td class="${t.type=='DEBIT'?'text-danger':'text-success'}">${t.amount.toLocaleString()}</td></tr>`).join('')}</tbody>
+                <table class="table table-sm"><thead><tr><th>تاریخ</th><th>شرح</th><th>نوع</th><th>مبلغ</th></tr></thead>
+                <tbody>${d.l.map(t => `<tr><td>${t.date}</td><td>${t.desc}</td><td>${t.type == 'DEBIT' ? 'بدهکار' : 'بستانکار'}</td><td class="${t.type=='DEBIT'?'text-danger':'text-success'}">${toman(t.amount)}</td></tr>`).join('')}</tbody>
                 </table>
             </div>
             <form action="/action/pay" method="POST" class="input-group mb-3">
@@ -175,25 +255,34 @@ def dashboard():
         for i in range(1, r['capacity'] + 1):
             b_data = next((b for b in bookings if b['room_id']==r['id'] and b['bed_number']==i), None)
             if b_data:
-                # محاسبه تراز شخص
-                deb = conn.execute("SELECT SUM(amount) FROM journal WHERE ref_id=? AND type='DEBIT'", (b_data['id'],)).fetchone()[0] or 0
-                cre = conn.execute("SELECT SUM(amount) FROM journal WHERE ref_id=? AND type='CREDIT' AND category='PAYMENT'", (b_data['id'],)).fetchone()[0] or 0
-                b_data['bal'] = deb - cre
-                if b_data['bal'] > 0: total_debt += b_data['bal']
+                # محاسبه خلاصه مالی شخص برای نمایش روی تخت
+                summary = guest_financial_summary(conn, b_data)
+                b_data.update(summary)
+                if b_data['balance'] > 0: total_debt += b_data['balance']
                 r['beds'].append({'status': 'occupied', 'info': b_data})
             else: r['beds'].append({'status': 'empty', 'num': i})
             
     stats = {'cash': cash, 'exp': exp, 'debt': total_debt}
-    return render_template_string(UI, rooms=rooms, s=stats)
+    return render_template_string(UI, rooms=rooms, s=stats, today=str(date.today()))
 
 @app.route('/action/checkin', methods=['POST'])
 def checkin():
     conn = get_db()
-    cur = conn.execute("INSERT INTO bookings (room_id, bed_number, name, passport, checkin, last_charge, rate) VALUES (?,?,?,?,?,?,?)", 
-                 (request.form['rid'], request.form['bnum'], request.form['name'], request.form['passport'], str(date.today()), str(date.today()), request.form['rate']))
+    checkin_date = request.form.get('checkin') or str(date.today())
+    checkout_date = request.form.get('checkout') or None
+    rate = int(request.form.get('rate') or 0)
+    pay_amount = int(request.form.get('pay', 0) or 0)
+
+    cur = conn.execute("INSERT INTO bookings (room_id, bed_number, name, passport, checkin, checkout, last_charge, rate) VALUES (?,?,?,?,?,?,?,?)",
+                 (request.form['rid'], request.form['bnum'], request.form['name'], request.form['passport'], checkin_date, checkout_date, checkin_date, rate))
     bid = cur.lastrowid
-    if int(request.form.get('pay', 0)) > 0:
-        conn.execute("INSERT INTO journal (ref_id, type, category, amount, date, desc) VALUES (?, 'CREDIT', 'PAYMENT', ?, ?, 'دریافت اولیه')", (bid, request.form['pay'], str(date.today())))
+
+    # هزینه شب اول همان ابتدا ثبت می‌شود تا مانده روی تخت از لحظه پذیرش درست باشد
+    conn.execute("INSERT INTO journal (ref_id, type, category, amount, date, desc) VALUES (?, 'DEBIT', 'STAY_CHARGE', ?, ?, ?)",
+                 (bid, rate, checkin_date, f"هزینه اقامت شب اول {checkin_date}"))
+
+    if pay_amount > 0:
+        conn.execute("INSERT INTO journal (ref_id, type, category, amount, date, desc) VALUES (?, 'CREDIT', 'PAYMENT', ?, ?, 'دریافت اولیه')", (bid, pay_amount, str(date.today())))
     conn.commit(); return redirect('/')
 
 @app.route('/action/pay', methods=['POST'])
@@ -213,13 +302,12 @@ def get_guest(bid):
     conn = get_db()
     g = dict(conn.execute("SELECT * FROM bookings WHERE id=?", (bid,)).fetchone())
     l = [dict(t) for t in conn.execute("SELECT * FROM journal WHERE ref_id=? ORDER BY id DESC", (bid,)).fetchall()]
-    deb = conn.execute("SELECT SUM(amount) FROM journal WHERE ref_id=? AND type='DEBIT'", (bid,)).fetchone()[0] or 0
-    cre = conn.execute("SELECT SUM(amount) FROM journal WHERE ref_id=? AND type='CREDIT' AND category='PAYMENT'", (bid,)).fetchone()[0] or 0
-    return jsonify({'g': g, 'l': l, 'bal': deb - cre})
+    summary = guest_financial_summary(conn, g)
+    return jsonify({'g': g, 'l': l, 'summary': summary, 'balance': summary['balance'], 'bal': summary['balance']})
 
 @app.route('/action/checkout/<int:bid>')
 def checkout(bid):
-    conn = get_db(); conn.execute("UPDATE bookings SET active=0 WHERE id=?", (bid,)); conn.commit(); return redirect('/')
+    conn = get_db(); conn.execute("UPDATE bookings SET active=0, checkout=COALESCE(checkout, ?) WHERE id=?", (str(date.today()), bid)); conn.commit(); return redirect('/')
 
 @app.route('/action/reset')
 def reset():
